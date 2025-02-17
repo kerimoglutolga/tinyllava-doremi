@@ -4,6 +4,10 @@
 #     https://www.atlassian.com/git/tutorials/saving-changes/gitignore
 
 # Node artifact files
+
+.cache/
+outputs/
+
 node_modules/
 dist/
 

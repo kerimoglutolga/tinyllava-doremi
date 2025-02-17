@@ -1,7 +1,7 @@
 import os
 import torch
 from torch import nn
-
+import torch.distributed as dist
 from torch.utils.data import Sampler
 
 from transformers import Trainer
@@ -14,6 +14,8 @@ from transformers.trainer import (
     logger,
 )
 from typing import List, Optional
+
+import wandb
 
 from ..utils.train_utils import *
 
@@ -227,5 +229,79 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
 
+class DoReMiTrainer(LLaVATrainer):
+    def __init__(self, *args, **kwargs):
+        LLaVATrainer.__init__(self, *args, **kwargs)
 
+        self.num_domains = 6
+        self.reweight_eta = 0.5
+        self.reweight_eps = 1e-2
+
+        self.train_domain_weights_dict = {i: 1.0 / self.num_domains for i in range(self.num_domains)}
+        self.domain_list = list(sorted(self.train_domain_weights_dict.keys()))
+        self.sampling_weights = torch.tensor([self.train_domain_weights_dict[domain] for domain in self.domain_list])
+
+        self.pertoken_scores = []
+        self.token_masks = []
+        self.domain_ids = []
+
+    def write_weights(self, weights):
+        self.model.update_counter += 1
+        self.model.train_domain_weights[:] = weights.float()
+        self.model.avg_domain_weights[:] = (self.model.avg_domain_weights * (self.model.update_counter - 1) + weights) / self.model.update_counter
+
+    def read_weights(self):
+        return self.model.train_domain_weights.clone()
+
+    def set_attributes(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def update_domain_weights(self, per_domain_scores):
+        wandb_log_dict = {}
+        train_domain_weights = self.read_weights()
+
+        self.model.perdomain_scores[:] = torch.tensor(per_domain_scores).float()
+        log_new_train_domain_weights = torch.log(train_domain_weights) + self.reweight_eta * self.model.perdomain_scores
+        log_new_train_domain_weights = log_new_train_domain_weights - torch.logsumexp(log_new_train_domain_weights, dim=0)
+        train_domain_weights = (1-self.reweight_eps) * torch.exp(log_new_train_domain_weights) + self.reweight_eps / len(log_new_train_domain_weights)
+        self.write_weights(train_domain_weights)
+
+        for domain_idx in range(len(train_domain_weights)):
+            domain_name = self.domain_list[domain_idx]
+            wandb_log_dict[f'avg_domain_weights/{domain_name}'] = self.model.avg_domain_weights[domain_idx].item()
+            wandb_log_dict[f'train_domain_weights/{domain_name}'] = self.model.train_domain_weights[domain_idx].item()
+            wandb_log_dict[f'perdomain_scores/{domain_name}'] = self.model.perdomain_scores[domain_idx].item()
+
+        wandb.log(wandb_log_dict, commit=False)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
+            per_domain_losses = outputs.per_domain_losses
+            token_mask = outputs.token_mask
+
+            logger.info(f"domains {outputs.domains.shape}")
+            
+            if self.is_local_process_zero():
+                self.update_domain_weights(per_domain_losses)
+
+            train_domain_weights = self.read_weights().to(per_domain_losses.device).float()
+            curr_domain_weights = train_domain_weights[outputs.domains][token_mask].detach()
+
+            normalizer = curr_domain_weights.detach().sum()
+            # Gather normalizer across GPUs.
+            dist.all_reduce(normalizer, op=torch.distributed.ReduceOp.SUM)
+            normalizer = torch.clip(normalizer, min=1e-10) / self.args.world_size
+
+            # Compute the final weighted loss.
+            loss = (outputs.per_token_loss[token_mask] * curr_domain_weights.detach()).sum() / normalizer
+            loss = loss.mean()  # Average the loss for multi-GPU training.
+
+            loss = self.deepspeed.backward(loss)
+            return loss
 

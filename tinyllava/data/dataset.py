@@ -14,10 +14,20 @@ from ..utils.constants import *
 import transformers
 import torch
 from torch.utils.data import Dataset
+from transformers.utils import logging
 
-
+logger = logging.get_logger(__name__)
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+DOMAIN_TO_INT = {
+    "coco": 0,
+    "gqa": 1,
+    "ocr_vqa": 2,
+    "text": 3,
+    "textvqa": 4,
+    "vg": 5,
+}
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -59,6 +69,13 @@ class LazySupervisedDataset(Dataset):
         data_dict = self.text_preprocess(copy.deepcopy(sources["conversations"]))
         if 'image' in sources:
             image_file = self.list_data_dict[i]['image']
+
+            domain =  image_file.split('/')[0]
+            if domain in DOMAIN_TO_INT:
+                data_dict["domain"] = DOMAIN_TO_INT[domain]
+            else:
+                data_dict["domain"] = 0
+
             image_folder = self.data_args.image_folder
             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             image = self.image_preprocess(image)
@@ -68,6 +85,8 @@ class LazySupervisedDataset(Dataset):
             # print(f'{i}:{sources}')
             crop_size = getattr(self.data_args.image_processor, 'crop_size', getattr(self.data_args.image_processor, 'size'))
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+
+            data_dict["domain"] = DOMAIN_TO_INT['text']
         return data_dict
 
 
@@ -90,6 +109,12 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(labels,
                                                  batch_first=True,
                                                  padding_value=IGNORE_INDEX)
+        
+        # logger.info(f"Padding token id: {self.tokenizer.pad_token_id}")
+        # logger.info(f"EOS token id: {self.tokenizer.eos_token_id}")
+        # logger.info(f"UNK token id: {self.tokenizer.unk_token_id}")
+        # logger.info(f"Ignore index: {IGNORE_INDEX}")
+
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
         labels = labels[:, :self.tokenizer.model_max_length]
@@ -112,6 +137,15 @@ class DataCollatorForSupervisedDataset(object):
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+        else:
+            raise ValueError('Image is not in the instances')
+        
+        # Dummy domains for DoReMi testing
+        batch_size = len(instances)
+        domains = torch.Tensor([instance["domain"] for instance in instances]).long().unsqueeze(1)
+        batch['domains'] = domains
+
+        # logger.info(f"Domain tensor shape: {domains.shape}")
 
         return batch
 

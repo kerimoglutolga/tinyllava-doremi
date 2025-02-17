@@ -1,3 +1,4 @@
+import copy
 from packaging import version
 import pathlib
 
@@ -5,7 +6,7 @@ import tokenizers
 import transformers
 
 
-from tinyllava.train.tinyllava_trainer import LLaVATrainer
+from tinyllava.train.tinyllava_trainer import LLaVATrainer, DoReMiTrainer
 from tinyllava.training_recipe import TrainingRecipeFactory
 from tinyllava.utils import *
 from tinyllava.model import *
@@ -55,35 +56,80 @@ def train():
     
     logger_setting(getattr(training_arguments, 'output_dir', None))
 
-    training_recipe = TrainingRecipeFactory(training_arguments.training_recipe)(training_arguments) 
-    # model_args contain arguements for huggingface model .from_pretrained function
-    model_args = load_settings(model_arguments, data_arguments, training_arguments)
-    model_args = training_recipe.add_args(model_args)
-    model_config = TinyLlavaConfig()
-    model_config.load_from_config(model_arguments)
-    model = TinyLlavaForConditionalGeneration(model_config)
-    # load pretrained checkpoint
-    if training_arguments.pretrained_model_path is not None:
-        model = training_recipe.load(model, model_args)
-    else:
-        model.load_llm(**model_args['llm'])
-        model.load_vision_tower(**model_args['vision_tower'])
-        model.load_connector(**model_args['connector'])
+    if not training_arguments.use_doremi:
+        training_recipe = TrainingRecipeFactory(training_arguments.training_recipe)(training_arguments) 
+        # model_args contain arguements for huggingface model .from_pretrained function
+        model_args = load_settings(model_arguments, data_arguments, training_arguments)
+        model_args = training_recipe.add_args(model_args)
+        model_config = TinyLlavaConfig()
+        model_config.load_from_config(model_arguments)
+        model = TinyLlavaForConditionalGeneration(model_config)
+        # load pretrained checkpoint
+        if training_arguments.pretrained_model_path is not None:
+            model = training_recipe.load(model, model_args)
+        else:
+            model.load_llm(**model_args['llm'])
+            model.load_vision_tower(**model_args['vision_tower'])
+            model.load_connector(**model_args['connector'])
 
-    model = training_recipe(model)
-    model.config.use_cache = False
-    model.config.image_aspect_ratio = data_arguments.image_aspect_ratio
+        model = training_recipe(model)
+        model.config.use_cache = False
+        model.config.image_aspect_ratio = data_arguments.image_aspect_ratio
+    else:
+        training_arguments_ref = copy.deepcopy(training_arguments)
+        training_arguments_ref.pretrained_model_path = training_arguments_ref.doremi_reference_model_path
+        training_arguments_ref.tune_type_llm = "frozen"
+        training_arguments_ref.tune_type_vision_tower = "frozen"
+        training_arguments_ref.tune_type_connector = "frozen"
+        training_recipe_ref = TrainingRecipeFactory(training_arguments.training_recipe)(training_arguments_ref)
+
+        reference_model_config = TinyLlavaConfig()
+        reference_model_config.load_from_config(model_arguments)
+        reference_model = TinyLlavaForConditionalGeneration(reference_model_config)
+        model_args_ref = load_settings(model_arguments, data_arguments, training_arguments_ref)
+        reference_model = training_recipe_ref.load(reference_model, model_args_ref)
+        reference_model = training_recipe_ref(reference_model)
+        reference_model.config.use_cache = False
+        reference_model.config.image_aspect_ratio = data_arguments.image_aspect_ratio
+
+        training_arguments.tune_type_llm = "full"
+        training_arguments.tune_type_connector = "frozen"
+        training_arguments.tune_type_vision_tower = "frozen"
+        training_recipe = TrainingRecipeFactory(training_arguments.training_recipe)(training_arguments) 
+        model_args = load_settings(model_arguments, data_arguments, training_arguments)
+        model_args = training_recipe.add_args(model_args)
+        model_config = TinyLlavaConfig()
+        model_config.load_from_config(model_arguments)
+
+        model = TinyLlavaForDoReMi(reference_model=reference_model, config=model_config)
+        if training_arguments.pretrained_model_path is not None:
+            model = training_recipe.load(model, model_args)
+        else:
+            model.load_llm(**model_args['llm'])
+            model.load_vision_tower(**model_args['vision_tower'])
+            model.load_connector(**model_args['connector'])
+        model = training_recipe(model)
+        model.config.use_cache = False
+        model.config.image_aspect_ratio = data_arguments.image_aspect_ratio
+    
     tokenizer = model.tokenizer
     data_arguments.image_processor = model.vision_tower._image_processor
     data_arguments.is_multimodal = True
+
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_arguments)
     log_trainable_params(model)  # not work well with zero3
-    trainer = LLaVATrainer(model=model, #does not require model.to(device), huggingface/deepspeed does it for you?
-                           tokenizer=tokenizer,
-                           args=training_arguments,
-                           **data_module)
-    
+
+    if training_arguments.use_doremi:
+        trainer = DoReMiTrainer(model=model, #does not require model.to(device), huggingface/deepspeed does it for you?
+                            tokenizer=tokenizer,
+                            args=training_arguments,
+                            **data_module)
+    else:
+        trainer = LLaVATrainer(model=model, #does not require model.to(device), huggingface/deepspeed does it for you?
+                            tokenizer=tokenizer,
+                            args=training_arguments,
+                            **data_module)
     trainer.train()
     
     training_recipe.save(model, trainer)

@@ -1,0 +1,6 @@
+#!/iopsstor/scratch/cscs/tkerimog/tinyllava/TinyLLaVA_Factory_new/venv/bin/python
+
+from deepspeed.env_report import cli_main
+
+if __name__ == '__main__':
+    cli_main()

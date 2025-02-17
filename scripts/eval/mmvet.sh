@@ -1,8 +1,8 @@
 #!/bin/bash
 
-MODEL_PATH="/mnt/data/sata/yinghu/checkpoints/llava_factory/tiny-llava-phi-2-clip-vit-large-patch14-336-baseline-finetune/"
-MODEL_NAME="tiny-llava-phi-2-clip-vit-large-patch14-336-baseline-finetune2"
-EVAL_DIR="/home/ai/data/llava/dataset/eval"
+MODEL_PATH="/iopsstor/scratch/cscs/tkerimog/tinyllava/TinyLLaVA_Factory_new/outputs/tiny-llava-OpenELM-270M-Instruct-siglip-so400m-patch14-384-elm_base-finetune/checkpoint-5195"
+MODEL_NAME="tiny-llava-OpenELM-270M-Instruct-siglip-so400m-patch14-384-elm_base-finetune"
+EVAL_DIR="/iopsstor/scratch/cscs/tkerimog/tinyllava/data/eval"
 
 python -m tinyllava.eval.model_vqa \
     --model-path $MODEL_PATH \

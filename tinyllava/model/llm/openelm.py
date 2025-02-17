@@ -19,6 +19,9 @@ from transformers.modeling_outputs import (
 )
 from transformers.utils import logging
 
+from tinyllava.model.modelling_outputs import CausalLMOutputWithPerTokenLoss
+from tinyllava.utils.constants import IGNORE_INDEX
+
 logger = logging.get_logger(__name__)
 
 # this import has to be relative, otherwise, when setting trust_remote_code=True
@@ -1179,22 +1182,34 @@ class OpenELMForCausalLM(OpenELMPreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
+            per_token_loss_fct = CrossEntropyLoss(reduction="none")
+
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            per_token_loss = per_token_loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+        )
+
+        if labels is None:
+            return output 
+        
+        return CausalLMOutputWithPerTokenLoss(
+            **output,
+            per_token_loss=per_token_loss,
+            token_mask=shift_labels.ne(IGNORE_INDEX),
         )
 
     def prepare_inputs_for_generation(

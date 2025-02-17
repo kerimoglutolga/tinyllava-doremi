@@ -9,6 +9,11 @@ from torch import nn
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
+from transformers.utils import logging
+
+from tinyllava.model.modelling_outputs import CausalLMOutputWithPerTokenLoss, CausalLMOutputForDoReMi
+
+logger = logging.get_logger(__name__)
 
 from . import LLMFactory, ConnectorFactory, VisionTowerFactory
 from .configuration_tinyllava import TinyLlavaConfig
@@ -57,7 +62,6 @@ class TinyLlavaPreTrainedModel(PreTrainedModel):
 
 class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
     def __init__(self, config: TinyLlavaConfig):
-        
         super().__init__(config)
 
         self.language_model = LLMFactory(config.llm_model_name_or_path)[0](config.text_config)
@@ -119,8 +123,10 @@ class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        domains: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, Union[CausalLMOutputWithPast, CausalLMOutputWithPerTokenLoss]]:
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         if inputs_embeds is None:
             (
                 input_ids,
@@ -138,6 +144,7 @@ class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
                 images,
                 image_sizes
             )
+
         return self.language_model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -200,8 +207,6 @@ class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
         image_features = self.connector(image_features)
         return image_features
     
-    
-    
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
                                       inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
@@ -223,7 +228,6 @@ class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        
         image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
@@ -378,7 +382,35 @@ class TinyLlavaForConditionalGeneration(TinyLlavaPreTrainedModel):
     def load_connector(self, **kwargs):
         self.connector.load_model(**kwargs)
 
-            
 
+class TinyLlavaForDoReMi(TinyLlavaForConditionalGeneration):
+    def __init__(self, config: TinyLlavaConfig,
+                 reference_model: TinyLlavaForConditionalGeneration,
+                 num_domains: int = 6):
+        super().__init__(config=config)
+        self.accepts_loss_kwargs = False
         
+        self.reference_model = reference_model
         
+        #for param in self.reference_model.parameters():
+        #    param.requires_grad = False
+        
+        self.num_domains = num_domains
+        self.update_counter = 0
+        self.train_domain_weights = torch.ones(self.num_domains) / self.num_domains
+        self.avg_domain_weights = torch.ones(self.num_domains) / self.num_domains
+        self.perdomain_scores = torch.ones(self.num_domains) / self.num_domains
+    
+    def forward(self, *args, **kwargs):
+        proxy_output = super().forward(*args, **kwargs)
+        reference_output = self.reference_model(*args, **kwargs)
+
+        output = CausalLMOutputForDoReMi(
+            **proxy_output,
+            _domains=kwargs["domains"],
+            reference_per_token_loss=reference_output.per_token_loss,
+        )
+
+        per_domain_losses = output.per_domain_losses 
+
+        return output

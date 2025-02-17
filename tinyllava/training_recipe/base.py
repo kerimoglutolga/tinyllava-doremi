@@ -105,7 +105,7 @@ class BaseTrainingRecipe:
             if trainer.deepspeed:
                 torch.cuda.synchronize()
             trainer.save_model(self.training_arguments.output_dir)
-            return
+            #return
         
         #the followings are for pretrain stage
         #save language model
